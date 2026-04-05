@@ -33,17 +33,31 @@ if not st.session_state.user_id:
     st.stop() # 关键：拦截下面的所有代码执行
 
 # ==========================================
+# 0.1 学科、API 与目录路由初始化 (核心修改区)
+# ==========================================
+# 🎯 更新：配置多学科及其对应的专属 Dify API Key
+# 建议在 .streamlit/secrets.toml 中配置这些 key
+SUBJECT_CONFIG = {
+    "外科学": st.secrets.get("DIFY_KEY_SURGERY", "YOUR_SURGERY_API_KEY"),
+    "内科学": st.secrets.get("DIFY_KEY_INTERNAL", "YOUR_INTERNAL_API_KEY"),
+    "影像学": st.secrets.get("DIFY_KEY_IMAGING", "YOUR_IMAGING_API_KEY"),
+    "流行病学": st.secrets.get("DIFY_KEY_EPI", "YOUR_EPI_API_KEY")
+}
+
+SUBJECTS = list(SUBJECT_CONFIG.keys())
+BASE_UPLOAD_DIR = "uploaded_materials"
+
+# 启动时自动为每个学科建立专属的“单间”
+for sub in SUBJECTS:
+    os.makedirs(os.path.join(BASE_UPLOAD_DIR, sub), exist_ok=True)
+
+# 动态获取学科专属路径的函数
+def get_subject_dir(subject_name):
+    return os.path.join(BASE_UPLOAD_DIR, subject_name)
+
+# ==========================================
 # 1. 核心工具函数与云端初始化
 # ==========================================
-UPLOAD_DIR = "uploaded_materials"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-try:
-    API_KEY = st.secrets["DIFY_API_KEY"]
-except:
-    st.error("❌ 云端未配置 DIFY_API_KEY，请在 Advanced Settings 中配置。")
-    st.stop()
-
 def find_page_by_text(file_path, search_text):
     try:
         doc = fitz.open(file_path)
@@ -67,6 +81,7 @@ def display_pdf_with_page(file_path, page_num=1):
     st.caption(f"🚀 云端引擎已定位至第 {page_num} 页")
     st.markdown(pdf_display, unsafe_allow_html=True)
 
+# 本地 SQLite 数据库保持统一，通过 subject 字段区分，方便教研室端统一看板
 def init_db():
     conn = sqlite3.connect('medai_cloud.db')
     c = conn.cursor()
@@ -86,11 +101,11 @@ def log_to_db(student_id, subject, query, has_image=False):
 
 init_db()
 
-# --- 新增：Dify 图片上传黑科技 ---
-def upload_image_to_dify(image_bytes, file_name):
-    """先把图片传给 Dify 获取专属 ID，这是视觉大模型的硬性要求"""
+# 🎯 更新：视觉大模型上传函数，现在需要动态接收对应的 API Key
+def upload_image_to_dify(image_bytes, file_name, current_api_key):
+    """先把图片传给对应学科的 Dify 数据库获取专属 ID"""
     url = "https://api.dify.ai/v1/files/upload"
-    headers = {"Authorization": f"Bearer {API_KEY}"}
+    headers = {"Authorization": f"Bearer {current_api_key}"}
     files = {"file": (file_name, image_bytes, "image/jpeg")}
     data = {"user": st.session_state.user_id}
     try:
@@ -118,16 +133,23 @@ role = st.sidebar.radio("请选择身份：", ["🧑‍🎓 学生端", "👨‍
 if role == "🧑‍🎓 学生端":
     st.title("📚 医智元：期末复习导航")
     
-    # 学科选择器
-    subject = st.selectbox("🎯 请选择当前复习科目", ["外科学", "内科学", "系统解剖学", "生理学"])
+    # 🎯 动态调用全局学科列表
+    subject = st.selectbox("🎯 请选择当前复习科目", SUBJECTS)
     
-    # 状态初始化
-    if "chat_history" not in st.session_state: st.session_state.chat_history = []
+    # 获取当前选中学科对应的 API KEY
+    CURRENT_API_KEY = SUBJECT_CONFIG[subject]
+    if CURRENT_API_KEY.startswith("YOUR_"):
+        st.warning(f"⚠️ 当前科目【{subject}】尚未配置真实的 API Key，请在代码或 Secrets 中配置。")
+    
+    # 🎯 更新：状态初始化 (将聊天记录按学科隔离，防止串台)
+    chat_history_key = f"chat_history_{subject}"
+    if chat_history_key not in st.session_state: 
+        st.session_state[chat_history_key] = []
     if "show_pdf" not in st.session_state: st.session_state.show_pdf = False
     if "current_page" not in st.session_state: st.session_state.current_page = 1
 
-    # 渲染历史记录
-    for msg_idx, msg in enumerate(st.session_state.chat_history):
+    # 渲染历史记录 (读取当前学科的记忆)
+    for msg_idx, msg in enumerate(st.session_state[chat_history_key]):
         with st.chat_message(msg["role"]):
             if msg.get("image_msg"):
                 st.info("📸 您发送了一张图片")
@@ -137,15 +159,14 @@ if role == "🧑‍🎓 学生端":
                     for i, s in enumerate(msg["real_sources"]):
                         doc_name = s.get('document_name')
                         st.info(f"🎯 证据来自《{doc_name}》")
-                        local_path = os.path.join(UPLOAD_DIR, doc_name)
-                        if os.path.exists(local_path) and st.button(f"📖 定位原文", key=f"hist_{msg_idx}_{i}"):
+                        local_path = os.path.join(get_subject_dir(subject), doc_name)
+                        if os.path.exists(local_path) and st.button(f"📖 定位原文", key=f"hist_{subject}_{msg_idx}_{i}"):
                             st.session_state.current_page = find_page_by_text(local_path, s.get('content'))
                             st.session_state.current_pdf = local_path
                             st.session_state.show_pdf = True
                             st.rerun()
 
     st.markdown("---")
-    # 巧妙的条件渲染：防止摄像头自动抢占
     input_mode = st.radio(
         "选择图片输入方式（可选）：", 
         ["🚫 纯文字提问", "🖼️ 上传本地图片", "📸 开启相机拍照"], 
@@ -162,32 +183,31 @@ if role == "🧑‍🎓 学生端":
         camera_img = st.camera_input("对准题目拍照")
 
     user_query = st.chat_input("询问教材内容或解析上方图片...")
-
-    # 获取实际要用的图片
     final_img = camera_img if camera_img else uploaded_img
+    
     if user_query or final_img:
         query_text = user_query if user_query else "请根据你们的教材，帮我解答图片中的医学问题。"
         
-        st.session_state.chat_history.append({"role": "user", "content": query_text, "image_msg": True if final_img else False})
+        # 保存到当前学科的记忆中
+        st.session_state[chat_history_key].append({"role": "user", "content": query_text, "image_msg": True if final_img else False})
         with st.chat_message("user"):
             if final_img: st.image(final_img, width=300)
             st.markdown(query_text)
 
         with st.chat_message("assistant"):
-            with st.spinner("AI 正在检索教材大脑..."):
+            with st.spinner(f"AI 正在检索【{subject}】教材大脑..."):
                 dify_files = []
-                # 如果有图片，先走上传逻辑获取 ID
                 if final_img:
-                    file_id = upload_image_to_dify(final_img.getvalue(), final_img.name if uploaded_img else "camera.jpg")
+                    # 🎯 传入当前学科专属的 API KEY
+                    file_id = upload_image_to_dify(final_img.getvalue(), final_img.name if uploaded_img else "camera.jpg", CURRENT_API_KEY)
                     if file_id:
                         dify_files.append({"type": "image", "transfer_method": "local_file", "upload_file_id": file_id})
 
-                headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-                # 将学科信息静默拼接到问题中，提升 Dify 检索精度
-                enhanced_query = f"[当前科目：{subject}] {query_text}"
+                # 🎯 使用当前学科专属的 API KEY 发起对话
+                headers = {"Authorization": f"Bearer {CURRENT_API_KEY}", "Content-Type": "application/json"}
                 payload = {
                     "inputs": {}, 
-                    "query": enhanced_query, 
+                    "query": query_text, # 不再需要硬拼接前缀，因为本身就是独立的数据库了
                     "response_mode": "blocking", 
                     "user": st.session_state.user_id,
                     "files": dify_files
@@ -205,18 +225,17 @@ if role == "🧑‍🎓 学生端":
                             for i, doc in enumerate(sources):
                                 d_name = doc.get("document_name")
                                 st.success(f"🎯 《{d_name}》")
-                                path = os.path.join(UPLOAD_DIR, d_name)
-                                if os.path.exists(path) and st.button(f"📖 定位原文：{d_name}", key=f"new_{i}_{datetime.now().timestamp()}"):
+                                path = os.path.join(get_subject_dir(subject), d_name)
+                                if os.path.exists(path) and st.button(f"📖 定位原文：{d_name}", key=f"new_{subject}_{i}_{datetime.now().timestamp()}"):
                                     st.session_state.current_page = find_page_by_text(path, doc.get("content"))
                                     st.session_state.current_pdf = path
                                     st.session_state.show_pdf = True
                                     st.rerun()
                     
-                    st.session_state.chat_history.append({
+                    st.session_state[chat_history_key].append({
                         "role": "assistant", "content": answer, 
                         "real_sources": sources
                     })
-                    # 记录数据库
                     log_to_db(st.session_state.user_id, subject, query_text, True if final_img else False)
                     
                 except Exception as e:
@@ -231,16 +250,49 @@ if role == "🧑‍🎓 学生端":
         display_pdf_with_page(st.session_state.current_pdf, st.session_state.current_page)
 
 # ==========================================
-# 4. 教研室端 / 教师端
+# 4. 教研室端 / 教师端 (保持不变)
 # ==========================================
 elif role == "👨‍🏫 教师端":
-    st.title("📤 资产入库")
-    files = st.file_uploader("上传 PDF 教材", type=["pdf"], accept_multiple_files=True)
-    if st.button("🚀 确认上传"):
-        for f in files:
-            with open(os.path.join(UPLOAD_DIR, f.name), "wb") as save_f:
-                save_f.write(f.getbuffer())
-        st.success("已存入云端临时目录")
+    st.title("📤 教研室资产管理中心")
+    st.markdown("在这里管理您的云端教材库。您上传的文件将直接用于学生端的**【原文精准定位】**。")
+    
+    target_subject = st.selectbox("📂 选择目标入库学科", SUBJECTS)
+    st.subheader(f"当前管理: 【{target_subject}】书库")
+    
+    current_subject_dir = get_subject_dir(target_subject)
+    existing_files = os.listdir(current_subject_dir)
+    pdf_files = [f for f in existing_files if f.endswith('.pdf')]
+    
+    if pdf_files:
+        file_data = []
+        for f in pdf_files:
+            file_path = os.path.join(current_subject_dir, f)
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            file_data.append({
+                "📄 教材名称": f, 
+                "💾 大小 (MB)": f"{size_mb:.2f}", 
+                "🟢 状态": "已就绪"
+            })
+        st.dataframe(pd.DataFrame(file_data), use_container_width=True, hide_index=True)
+    else:
+        st.info(f"📭 当前【{target_subject}】书库为空。")
+        
+    st.markdown("---")
+    st.subheader("🚀 上传新教材 / 课件")
+    st.info("💡 提示：为保证 AI 能够检索到，请确保同名 PDF 也已同步至 Dify 后台对应的知识库。")
+    files = st.file_uploader("将 PDF 拖拽至此 (支持批量)", type=["pdf"], accept_multiple_files=True)
+    
+    if st.button("⚡ 确认入库并激活定位", type="primary"):
+        if files:
+            with st.spinner("正在将教材写入云端存储..."):
+                for f in files:
+                    save_path = os.path.join(current_subject_dir, f.name)
+                    with open(save_path, "wb") as save_f:
+                        save_f.write(f.getbuffer())
+            st.success(f"✅ 教材已成功存入【{target_subject}】云端书库！")
+            st.rerun() 
+        else:
+            st.warning("⚠️ 别急，您还没选择任何文件呢！")
 
 elif role == "🏛️ 教研室端":
     st.title("📊 监控大屏")
