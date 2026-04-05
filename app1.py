@@ -145,18 +145,26 @@ if role == "🧑‍🎓 学生端":
                             st.rerun()
 
     st.markdown("---")
-    # 拍照解题与文本输入区
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        uploaded_img = st.file_uploader("🖼️ 上传题目截图", type=["jpg", "jpeg", "png"])
-    with col2:
-        camera_img = st.camera_input("📸 或直接拍照解题")
-        
+    # 巧妙的条件渲染：防止摄像头自动抢占
+    input_mode = st.radio(
+        "选择图片输入方式（可选）：", 
+        ["🚫 纯文字提问", "🖼️ 上传本地图片", "📸 开启相机拍照"], 
+        horizontal=True
+    )
+
+    uploaded_img = None
+    camera_img = None
+
+    if input_mode == "🖼️ 上传本地图片":
+        uploaded_img = st.file_uploader("请选择设备中的图片", type=["jpg", "jpeg", "png"])
+    elif input_mode == "📸 开启相机拍照":
+        st.info("💡 浏览器可能会请求摄像头权限，请点击「允许」。")
+        camera_img = st.camera_input("对准题目拍照")
+
     user_query = st.chat_input("询问教材内容或解析上方图片...")
 
     # 获取实际要用的图片
     final_img = camera_img if camera_img else uploaded_img
-
     if user_query or final_img:
         query_text = user_query if user_query else "请根据你们的教材，帮我解答图片中的医学问题。"
         
